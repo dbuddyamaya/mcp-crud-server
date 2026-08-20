@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 
-const BACKEND_URL = "http://localhost:3001";
+const BACKEND_URL = "https://mcp-crud-server.onrender.com";
 
 export default function App() {
   const [connected, setConnected] = useState(false);
