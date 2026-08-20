@@ -2,13 +2,13 @@
   "name": "mcp-crud-server",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "http-server.js",
   "type": "module",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "start": "node index.js",
+    "start": "node http-server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
