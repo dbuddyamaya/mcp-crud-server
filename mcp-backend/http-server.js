@@ -43,6 +43,12 @@ async function connectMcp() {
   const transport = new StdioClientTransport({
     command: "node",
     args: [SERVER_SCRIPT],
+    // StdioClientTransport does NOT inherit the parent process's full
+    // environment by default (it only forwards a minimal safe set like
+    // PATH). Without this, index.js's child process never sees
+    // AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / etc., even though
+    // they're correctly set on the parent (this http-server.js process).
+    env: process.env,
   });
   mcpClient = new Client(
     { name: "mcp-frontend-backend", version: "1.0.0" },
