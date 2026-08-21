@@ -39,20 +39,27 @@ app.use(express.json());
 const REQUIRED_TOKEN = process.env.MCP_ACCESS_TOKEN;
 
 function checkAuth(req, res, next) {
+  // TEMPORARILY DISABLED while testing whether Claude Desktop's connector UI
+  // can reach this server at all. Claude Desktop's "Add custom connector"
+  // screen only supports "no auth" or full OAuth Client ID/Secret — there's
+  // no field for a plain bearer token, so the token-check approach below
+  // has nowhere to be entered from that UI. Once the connection itself is
+  // confirmed working, revisit real auth (see the OAuth note at the bottom
+  // of this file) before sharing this URL beyond a quick personal test.
   if (!REQUIRED_TOKEN) {
     console.warn(
       "WARNING: MCP_ACCESS_TOKEN is not set — running with no auth check.",
     );
-    return next();
   }
-  const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-  if (token !== REQUIRED_TOKEN) {
-    return res
-      .status(401)
-      .json({ error: "Unauthorized. Provide a valid Bearer token." });
-  }
-  next();
+  return next();
+
+  // Original token-check logic, kept for reference / future use:
+  // const header = req.headers.authorization || "";
+  // const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  // if (token !== REQUIRED_TOKEN) {
+  //   return res.status(401).json({ error: "Unauthorized. Provide a valid Bearer token." });
+  // }
+  // next();
 }
 
 // ── Session store: sessionId -> transport ───────────────────────────────
