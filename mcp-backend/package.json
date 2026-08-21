@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node http-server.js",
+    "start:mcp-http": "node mcp-http-server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
