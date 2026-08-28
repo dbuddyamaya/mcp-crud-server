@@ -191,12 +191,10 @@ app.post("/token", (req, res) => {
       return res.status(400).json({ error: "invalid_grant" });
     }
     if (sha256Base64Url(code_verifier) !== entry.code_challenge) {
-      return res
-        .status(400)
-        .json({
-          error: "invalid_grant",
-          error_description: "PKCE verification failed",
-        });
+      return res.status(400).json({
+        error: "invalid_grant",
+        error_description: "PKCE verification failed",
+      });
     }
 
     authCodes.delete(code); // one-time use
@@ -256,11 +254,46 @@ function checkAuth(req, res, next) {
   next();
 }
 
+// ── Activity log ──────────────────────────────────────────────────────────
+// In-memory only (resets on restart/redeploy) — fine for a personal server.
+// Logs every /mcp call to the console (free to view in Render's log tab)
+// and keeps the last MAX_EVENTS in memory for the /activity endpoint.
+const MAX_EVENTS = 200;
+const activityLog = [];
+
+function logActivity(event) {
+  const entry = { timestamp: new Date().toISOString(), ...event };
+  activityLog.push(entry);
+  if (activityLog.length > MAX_EVENTS) activityLog.shift();
+  console.log(`[activity] ${JSON.stringify(entry)}`);
+}
+
+// Best-effort extraction of the interesting bits from a JSON-RPC body.
+// Streamable HTTP can also send an array of batched requests — handle both.
+function summarizeRpcBody(body) {
+  const msgs = Array.isArray(body) ? body : [body];
+  return msgs.map((m) => {
+    if (!m || typeof m !== "object") return { method: "unknown" };
+    if (m.method === "tools/call") {
+      return {
+        method: m.method,
+        tool: m.params?.name,
+        args: m.params?.arguments,
+      };
+    }
+    return { method: m.method };
+  });
+}
+
 // ── Session store: sessionId -> transport ───────────────────────────────
 const transports = {};
 
 async function handleMcpRequest(req, res) {
   const sessionId = req.headers["mcp-session-id"];
+  const start = Date.now();
+  const calls = req.body
+    ? summarizeRpcBody(req.body)
+    : [{ method: req.method }];
   let transport;
 
   if (sessionId && transports[sessionId]) {
@@ -293,15 +326,49 @@ async function handleMcpRequest(req, res) {
       },
       id: null,
     });
+    logActivity({
+      sessionId: sessionId || null,
+      calls,
+      status: 400,
+      durationMs: Date.now() - start,
+    });
     return;
   }
 
-  await transport.handleRequest(req, res, req.body);
+  try {
+    await transport.handleRequest(req, res, req.body);
+    logActivity({
+      sessionId: transport.sessionId || sessionId || null,
+      calls,
+      status: res.statusCode,
+      durationMs: Date.now() - start,
+    });
+  } catch (err) {
+    logActivity({
+      sessionId: transport.sessionId || sessionId || null,
+      calls,
+      status: "error",
+      error: err.message,
+      durationMs: Date.now() - start,
+    });
+    throw err;
+  }
 }
 
 app.post("/mcp", checkAuth, handleMcpRequest);
 app.get("/mcp", checkAuth, handleMcpRequest);
 app.delete("/mcp", checkAuth, handleMcpRequest);
+
+// View recent activity: GET /activity?token=<MCP_ACCESS_TOKEN>
+// (query param, not a Bearer header, so you can open it directly in a browser)
+app.get("/activity", (req, res) => {
+  if (OWNER_PASSWORD && req.query.token !== OWNER_PASSWORD) {
+    return res
+      .status(401)
+      .json({ error: "Add ?token=<your MCP_ACCESS_TOKEN> to view this." });
+  }
+  res.json({ count: activityLog.length, events: [...activityLog].reverse() });
+});
 
 app.get("/", (req, res) => {
   res.send("MCP remote connector is running. Point your MCP client at /mcp.");
