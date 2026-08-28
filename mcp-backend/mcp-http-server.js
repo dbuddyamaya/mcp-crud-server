@@ -462,6 +462,42 @@ app.get("/admin/billing", checkAdmin, async (req, res) => {
   });
 });
 
+// ── Admin: raw activity feed ─────────────────────────────────────────────
+// GET /admin/activity                     -> last 100 events, all accounts
+// GET /admin/activity?username=acme       -> last 100 events for one account
+// GET /admin/activity?username=acme&limit=500
+app.get("/admin/activity", checkAdmin, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 100, 1000);
+
+  if (req.query.username) {
+    const acct = await db.execute({
+      sql: "SELECT id, name FROM accounts WHERE username = ?",
+      args: [req.query.username],
+    });
+    if (!acct.rows[0])
+      return res.status(404).json({ error: "no account with that username" });
+
+    const result = await db.execute({
+      sql: `SELECT timestamp, method, tool, status, duration_ms
+            FROM usage_events WHERE account_id = ?
+            ORDER BY timestamp DESC LIMIT ?`,
+      args: [acct.rows[0].id, limit],
+    });
+    return res.json({
+      account: acct.rows[0].name,
+      count: result.rows.length,
+      events: result.rows,
+    });
+  }
+
+  const result = await db.execute({
+    sql: `SELECT timestamp, account_name, method, tool, status, duration_ms
+          FROM usage_events ORDER BY timestamp DESC LIMIT ?`,
+    args: [limit],
+  });
+  res.json({ count: result.rows.length, events: result.rows });
+});
+
 // ── Activity logging ──────────────────────────────────────────────────────
 function summarizeRpcBody(body) {
   const msgs = Array.isArray(body) ? body : [body];
