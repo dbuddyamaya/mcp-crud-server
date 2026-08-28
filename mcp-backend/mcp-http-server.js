@@ -2,22 +2,22 @@
 /**
  * mcp-http-server.js
  *
- * Exposes the same tools as index.js over the MCP "Streamable HTTP"
- * transport, plus a minimal, self-hosted OAuth 2.1 authorization server
- * so Claude Desktop's "Add custom connector" flow can complete its
- * required OAuth + dynamic-client-registration handshake.
+ * MCP Streamable HTTP server with a self-hosted OAuth 2.1 authorization
+ * server, now multi-tenant: each of your clients gets their own account
+ * (username + password), and every tool call is persisted per-account in
+ * Turso (libSQL) so you can bill by query/tool-call count.
  *
- * This is intentionally minimal: it's sized for ONE user (you) hitting
- * this from Claude Desktop, not a multi-tenant public service.
- *   - Dynamic client registration (/register) accepts any client and
- *     stores it in memory — fine, since only you will ever register one.
- *   - The "consent screen" at /authorize is a single password field.
- *     Enter MCP_ACCESS_TOKEN there once; that's your login gate. There is
- *     no separate account system.
- *   - PKCE (S256) is enforced on the code exchange, per the MCP spec.
- *   - Everything (clients, auth codes, tokens) lives in memory. That's
- *     fine on a single Render instance but means re-authorizing after
- *     every restart/redeploy — acceptable for personal use.
+ * Required env vars:
+ *   PUBLIC_URL          - exact deployed https URL, e.g. https://mcp-server-2gey.onrender.com
+ *   TURSO_DATABASE_URL  - your Turso DB connection URL (libsql://...)
+ *   TURSO_AUTH_TOKEN    - your Turso DB auth token
+ *   ADMIN_TOKEN         - secret only you know; gates /admin/* endpoints
+ *
+ * All client accounts, OAuth clients/codes/tokens, and usage events are
+ * stored in Turso, so restarting/redeploying this service does NOT log
+ * out your clients or lose billing history. Only the live Streamable HTTP
+ * session map (`transports`) stays in memory, which is fine — those are
+ * just active connections, not billing data.
  *
  * Run with: node mcp-http-server.js
  */
@@ -25,6 +25,7 @@
 import "dotenv/config";
 import express from "express";
 import crypto, { randomUUID } from "node:crypto";
+import { createClient } from "@libsql/client";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createMcpServer } from "./server-factory.js";
@@ -34,31 +35,85 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.MCP_HTTP_PORT || process.env.PORT || 3002;
-// PUBLIC_URL must be the exact https URL this service is reachable at
-// (e.g. https://mcp-server-2gey.onrender.com). Required so the OAuth
-// metadata documents advertise correct absolute URLs.
 const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 
-// The single "password" used at the /authorize consent screen. Reuses the
-// same env var you already set on Render.
-const OWNER_PASSWORD = process.env.MCP_ACCESS_TOKEN;
-
-if (!OWNER_PASSWORD) {
+if (!ADMIN_TOKEN) {
   console.warn(
-    "WARNING: MCP_ACCESS_TOKEN is not set. The /authorize consent screen " +
-      "will accept ANY password. Set MCP_ACCESS_TOKEN before exposing this URL.",
+    "WARNING: ADMIN_TOKEN is not set. /admin/* endpoints will reject all requests until it is.",
   );
 }
 
-// ── In-memory OAuth state ────────────────────────────────────────────────
-const clients = new Map(); // client_id -> { redirect_uris, client_name }
-const authCodes = new Map(); // code -> { client_id, redirect_uri, code_challenge, expiresAt }
-const accessTokens = new Map(); // token -> { expiresAt }
-const refreshTokens = new Map(); // token -> { expiresAt } (long-lived)
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL,
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
 
-const CODE_TTL_MS = 5 * 60 * 1000; // 5 min to complete the exchange
-const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
-const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const CODE_TTL_MS = 5 * 60 * 1000;
+const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
+const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+// ── DB setup ──────────────────────────────────────────────────────────────
+async function initDb() {
+  await db.execute(`CREATE TABLE IF NOT EXISTS accounts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+  )`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS oauth_clients (
+    client_id TEXT PRIMARY KEY,
+    redirect_uris TEXT NOT NULL,
+    client_name TEXT,
+    created_at TEXT NOT NULL
+  )`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS auth_codes (
+    code TEXT PRIMARY KEY,
+    oauth_client_id TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  )`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS access_tokens (
+    token TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  )`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS refresh_tokens (
+    token TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  )`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS usage_events (
+    id TEXT PRIMARY KEY,
+    account_id TEXT,
+    account_name TEXT,
+    timestamp TEXT NOT NULL,
+    method TEXT,
+    tool TEXT,
+    status TEXT,
+    duration_ms INTEGER
+  )`);
+}
+
+// ── Password hashing (scrypt, no extra dependency) ──────────────────────
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+function verifyPassword(password, stored) {
+  const [salt, hash] = stored.split(":");
+  const hashBuf = Buffer.from(hash, "hex");
+  const testBuf = crypto.scryptSync(password, salt, 64);
+  return (
+    hashBuf.length === testBuf.length &&
+    crypto.timingSafeEqual(hashBuf, testBuf)
+  );
+}
 
 function base64url(buf) {
   return buf
@@ -67,13 +122,11 @@ function base64url(buf) {
     .replace(/\//g, "_")
     .replace(/=+$/, "");
 }
-
 function sha256Base64Url(input) {
   return base64url(crypto.createHash("sha256").update(input).digest());
 }
 
 // ── OAuth discovery metadata ─────────────────────────────────────────────
-// Protected Resource Metadata: tells the client where the auth server is.
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   res.json({
     resource: `${PUBLIC_URL}/mcp`,
@@ -81,7 +134,6 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => {
   });
 });
 
-// Authorization Server Metadata: describes the endpoints below.
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   res.json({
     issuer: PUBLIC_URL,
@@ -95,14 +147,22 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
   });
 });
 
-// ── Dynamic Client Registration ──────────────────────────────────────────
-app.post("/register", (req, res) => {
+// ── Dynamic Client Registration (per app instance, e.g. each client's Desktop) ─
+app.post("/register", async (req, res) => {
   const { redirect_uris, client_name } = req.body || {};
   if (!Array.isArray(redirect_uris) || redirect_uris.length === 0) {
     return res.status(400).json({ error: "invalid_client_metadata" });
   }
   const client_id = randomUUID();
-  clients.set(client_id, { redirect_uris, client_name });
+  await db.execute({
+    sql: "INSERT INTO oauth_clients (client_id, redirect_uris, client_name, created_at) VALUES (?, ?, ?, ?)",
+    args: [
+      client_id,
+      JSON.stringify(redirect_uris),
+      client_name || null,
+      new Date().toISOString(),
+    ],
+  });
   res.status(201).json({
     client_id,
     redirect_uris,
@@ -113,8 +173,8 @@ app.post("/register", (req, res) => {
   });
 });
 
-// ── Authorize (consent screen) ───────────────────────────────────────────
-app.get("/authorize", (req, res) => {
+// ── Authorize (per-client login form) ────────────────────────────────────
+app.get("/authorize", async (req, res) => {
   const {
     client_id,
     redirect_uri,
@@ -123,8 +183,13 @@ app.get("/authorize", (req, res) => {
     code_challenge_method,
   } = req.query;
 
-  const client = clients.get(client_id);
-  if (!client || !client.redirect_uris.includes(redirect_uri)) {
+  const result = await db.execute({
+    sql: "SELECT redirect_uris FROM oauth_clients WHERE client_id = ?",
+    args: [client_id],
+  });
+  const row = result.rows[0];
+  const redirectUris = row ? JSON.parse(row.redirect_uris) : null;
+  if (!row || !redirectUris.includes(redirect_uri)) {
     return res.status(400).send("Unknown client_id or redirect_uri.");
   }
   if (code_challenge_method !== "S256" || !code_challenge) {
@@ -134,40 +199,64 @@ app.get("/authorize", (req, res) => {
   res.send(`
     <html>
       <body style="font-family: sans-serif; max-width: 400px; margin: 80px auto;">
-        <h2>Authorize connector access</h2>
-        <p>Enter your access password to allow this connector to reach your MCP server.</p>
+        <h2>Sign in</h2>
+        <p>Enter the username and password you were given to connect.</p>
         <form method="POST" action="/authorize">
           <input type="hidden" name="client_id" value="${client_id}" />
           <input type="hidden" name="redirect_uri" value="${redirect_uri}" />
           <input type="hidden" name="state" value="${state || ""}" />
           <input type="hidden" name="code_challenge" value="${code_challenge}" />
-          <input type="password" name="password" placeholder="Access password" autofocus
-                 style="width: 100%; padding: 8px; margin: 12px 0;" />
-          <button type="submit" style="padding: 8px 16px;">Authorize</button>
+          <input type="text" name="username" placeholder="Username" autofocus
+                 style="width: 100%; padding: 8px; margin: 8px 0;" />
+          <input type="password" name="password" placeholder="Password"
+                 style="width: 100%; padding: 8px; margin: 8px 0;" />
+          <button type="submit" style="padding: 8px 16px;">Sign in</button>
         </form>
       </body>
     </html>
   `);
 });
 
-app.post("/authorize", (req, res) => {
-  const { client_id, redirect_uri, state, code_challenge, password } =
+app.post("/authorize", async (req, res) => {
+  const { client_id, redirect_uri, state, code_challenge, username, password } =
     req.body || {};
 
-  const client = clients.get(client_id);
-  if (!client || !client.redirect_uris.includes(redirect_uri)) {
+  const clientResult = await db.execute({
+    sql: "SELECT redirect_uris FROM oauth_clients WHERE client_id = ?",
+    args: [client_id],
+  });
+  const clientRow = clientResult.rows[0];
+  const redirectUris = clientRow ? JSON.parse(clientRow.redirect_uris) : null;
+  if (!clientRow || !redirectUris.includes(redirect_uri)) {
     return res.status(400).send("Unknown client_id or redirect_uri.");
   }
-  if (OWNER_PASSWORD && password !== OWNER_PASSWORD) {
-    return res.status(401).send("Incorrect password. Go back and try again.");
+
+  const acctResult = await db.execute({
+    sql: "SELECT id, password_hash, active FROM accounts WHERE username = ?",
+    args: [username],
+  });
+  const account = acctResult.rows[0];
+  if (
+    !account ||
+    !account.active ||
+    !verifyPassword(password || "", account.password_hash)
+  ) {
+    return res
+      .status(401)
+      .send("Incorrect username or password. Go back and try again.");
   }
 
   const code = randomUUID();
-  authCodes.set(code, {
-    client_id,
-    redirect_uri,
-    code_challenge,
-    expiresAt: Date.now() + CODE_TTL_MS,
+  await db.execute({
+    sql: "INSERT INTO auth_codes (code, oauth_client_id, redirect_uri, code_challenge, account_id, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+    args: [
+      code,
+      client_id,
+      redirect_uri,
+      code_challenge,
+      account.id,
+      Date.now() + CODE_TTL_MS,
+    ],
   });
 
   const redirect = new URL(redirect_uri);
@@ -177,35 +266,53 @@ app.post("/authorize", (req, res) => {
 });
 
 // ── Token exchange ────────────────────────────────────────────────────────
-app.post("/token", (req, res) => {
+app.post("/token", async (req, res) => {
   const { grant_type } = req.body || {};
 
   if (grant_type === "authorization_code") {
     const { code, redirect_uri, code_verifier, client_id } = req.body;
-    const entry = authCodes.get(code);
+    const result = await db.execute({
+      sql: "SELECT * FROM auth_codes WHERE code = ?",
+      args: [code],
+    });
+    const entry = result.rows[0];
 
-    if (!entry || entry.expiresAt < Date.now()) {
+    if (!entry || entry.expires_at < Date.now()) {
       return res.status(400).json({ error: "invalid_grant" });
     }
-    if (entry.client_id !== client_id || entry.redirect_uri !== redirect_uri) {
+    if (
+      entry.oauth_client_id !== client_id ||
+      entry.redirect_uri !== redirect_uri
+    ) {
       return res.status(400).json({ error: "invalid_grant" });
     }
     if (sha256Base64Url(code_verifier) !== entry.code_challenge) {
-      return res.status(400).json({
-        error: "invalid_grant",
-        error_description: "PKCE verification failed",
-      });
+      return res
+        .status(400)
+        .json({
+          error: "invalid_grant",
+          error_description: "PKCE verification failed",
+        });
     }
 
-    authCodes.delete(code); // one-time use
+    await db.execute({
+      sql: "DELETE FROM auth_codes WHERE code = ?",
+      args: [code],
+    });
 
     const access_token = randomUUID();
     const refresh_token = randomUUID();
-    accessTokens.set(access_token, {
-      expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS,
+    await db.execute({
+      sql: "INSERT INTO access_tokens (token, account_id, expires_at) VALUES (?, ?, ?)",
+      args: [access_token, entry.account_id, Date.now() + ACCESS_TOKEN_TTL_MS],
     });
-    refreshTokens.set(refresh_token, {
-      expiresAt: Date.now() + REFRESH_TOKEN_TTL_MS,
+    await db.execute({
+      sql: "INSERT INTO refresh_tokens (token, account_id, expires_at) VALUES (?, ?, ?)",
+      args: [
+        refresh_token,
+        entry.account_id,
+        Date.now() + REFRESH_TOKEN_TTL_MS,
+      ],
     });
 
     return res.json({
@@ -218,14 +325,19 @@ app.post("/token", (req, res) => {
 
   if (grant_type === "refresh_token") {
     const { refresh_token } = req.body;
-    const entry = refreshTokens.get(refresh_token);
-    if (!entry || entry.expiresAt < Date.now()) {
+    const result = await db.execute({
+      sql: "SELECT * FROM refresh_tokens WHERE token = ?",
+      args: [refresh_token],
+    });
+    const entry = result.rows[0];
+    if (!entry || entry.expires_at < Date.now()) {
       return res.status(400).json({ error: "invalid_grant" });
     }
 
     const access_token = randomUUID();
-    accessTokens.set(access_token, {
-      expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS,
+    await db.execute({
+      sql: "INSERT INTO access_tokens (token, account_id, expires_at) VALUES (?, ?, ?)",
+      args: [access_token, entry.account_id, Date.now() + ACCESS_TOKEN_TTL_MS],
     });
 
     return res.json({
@@ -238,51 +350,156 @@ app.post("/token", (req, res) => {
   res.status(400).json({ error: "unsupported_grant_type" });
 });
 
-// ── Auth middleware for the actual MCP endpoint ──────────────────────────
-function checkAuth(req, res, next) {
+// ── Auth middleware for the MCP endpoint — resolves which account is calling ─
+async function checkAuth(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-  const entry = token && accessTokens.get(token);
 
-  if (!entry || entry.expiresAt < Date.now()) {
-    res.setHeader(
-      "WWW-Authenticate",
-      `Bearer resource_metadata="${PUBLIC_URL}/.well-known/oauth-protected-resource"`,
-    );
-    return res.status(401).json({ error: "Unauthorized" });
+  if (!token) return unauthorized(res);
+
+  const result = await db.execute({
+    sql: `SELECT access_tokens.account_id, accounts.name, accounts.active, access_tokens.expires_at
+          FROM access_tokens JOIN accounts ON accounts.id = access_tokens.account_id
+          WHERE access_tokens.token = ?`,
+    args: [token],
+  });
+  const entry = result.rows[0];
+  if (!entry || !entry.active || entry.expires_at < Date.now())
+    return unauthorized(res);
+
+  req.accountId = entry.account_id;
+  req.accountName = entry.name;
+  next();
+}
+function unauthorized(res) {
+  res.setHeader(
+    "WWW-Authenticate",
+    `Bearer resource_metadata="${PUBLIC_URL}/.well-known/oauth-protected-resource"`,
+  );
+  return res.status(401).json({ error: "Unauthorized" });
+}
+
+// ── Admin auth (you only) ────────────────────────────────────────────────
+function checkAdmin(req, res, next) {
+  if (!ADMIN_TOKEN || req.headers["x-admin-token"] !== ADMIN_TOKEN) {
+    return res
+      .status(401)
+      .json({ error: "Unauthorized. Set x-admin-token header." });
   }
   next();
 }
 
-// ── Activity log ──────────────────────────────────────────────────────────
-// In-memory only (resets on restart/redeploy) — fine for a personal server.
-// Logs every /mcp call to the console (free to view in Render's log tab)
-// and keeps the last MAX_EVENTS in memory for the /activity endpoint.
-const MAX_EVENTS = 200;
-const activityLog = [];
+// ── Admin: manage client accounts ────────────────────────────────────────
+app.post("/admin/accounts", checkAdmin, async (req, res) => {
+  const { name, username, password } = req.body || {};
+  if (!name || !username || !password) {
+    return res
+      .status(400)
+      .json({ error: "name, username, and password are required." });
+  }
+  const id = randomUUID();
+  try {
+    await db.execute({
+      sql: "INSERT INTO accounts (id, name, username, password_hash, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+      args: [
+        id,
+        name,
+        username,
+        hashPassword(password),
+        new Date().toISOString(),
+      ],
+    });
+  } catch (err) {
+    return res.status(409).json({ error: "username already taken" });
+  }
+  res.status(201).json({ id, name, username });
+});
 
-function logActivity(event) {
-  const entry = { timestamp: new Date().toISOString(), ...event };
-  activityLog.push(entry);
-  if (activityLog.length > MAX_EVENTS) activityLog.shift();
-  console.log(`[activity] ${JSON.stringify(entry)}`);
-}
+app.get("/admin/accounts", checkAdmin, async (req, res) => {
+  const result = await db.execute(
+    "SELECT id, name, username, active, created_at FROM accounts ORDER BY created_at",
+  );
+  res.json({ accounts: result.rows });
+});
 
-// Best-effort extraction of the interesting bits from a JSON-RPC body.
-// Streamable HTTP can also send an array of batched requests — handle both.
+app.patch("/admin/accounts/:id", checkAdmin, async (req, res) => {
+  const { active } = req.body || {};
+  await db.execute({
+    sql: "UPDATE accounts SET active = ? WHERE id = ?",
+    args: [active ? 1 : 0, req.params.id],
+  });
+  res.json({ ok: true });
+});
+
+// ── Admin: billing report ────────────────────────────────────────────────
+// GET /admin/billing?from=2026-08-01&to=2026-09-01
+app.get("/admin/billing", checkAdmin, async (req, res) => {
+  const from = req.query.from || "1970-01-01";
+  const to = req.query.to || new Date().toISOString();
+
+  const result = await db.execute({
+    sql: `SELECT account_id, account_name, COUNT(*) as call_count
+          FROM usage_events
+          WHERE method = 'tools/call' AND timestamp >= ? AND timestamp < ?
+          GROUP BY account_id, account_name
+          ORDER BY call_count DESC`,
+    args: [from, to],
+  });
+
+  const byToolResult = await db.execute({
+    sql: `SELECT account_id, account_name, tool, COUNT(*) as call_count
+          FROM usage_events
+          WHERE method = 'tools/call' AND timestamp >= ? AND timestamp < ?
+          GROUP BY account_id, account_name, tool
+          ORDER BY account_name, call_count DESC`,
+    args: [from, to],
+  });
+
+  res.json({
+    range: { from, to },
+    totals_by_account: result.rows,
+    breakdown_by_tool: byToolResult.rows,
+  });
+});
+
+// ── Activity logging ──────────────────────────────────────────────────────
 function summarizeRpcBody(body) {
   const msgs = Array.isArray(body) ? body : [body];
   return msgs.map((m) => {
     if (!m || typeof m !== "object") return { method: "unknown" };
-    if (m.method === "tools/call") {
-      return {
-        method: m.method,
-        tool: m.params?.name,
-        args: m.params?.arguments,
-      };
-    }
+    if (m.method === "tools/call")
+      return { method: m.method, tool: m.params?.name };
     return { method: m.method };
   });
+}
+
+async function logActivity({
+  accountId,
+  accountName,
+  calls,
+  status,
+  durationMs,
+}) {
+  const timestamp = new Date().toISOString();
+  for (const call of calls) {
+    console.log(
+      `[activity] ${JSON.stringify({ timestamp, accountId, accountName, ...call, status, durationMs })}`,
+    );
+    await db.execute({
+      sql: `INSERT INTO usage_events (id, account_id, account_name, timestamp, method, tool, status, duration_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      args: [
+        randomUUID(),
+        accountId || null,
+        accountName || null,
+        timestamp,
+        call.method || null,
+        call.tool || null,
+        String(status),
+        durationMs,
+      ],
+    });
+  }
 }
 
 // ── Session store: sessionId -> transport ───────────────────────────────
@@ -303,15 +520,14 @@ async function handleMcpRequest(req, res) {
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid) => {
         transports[sid] = transport;
-        console.log(`MCP session initialized: ${sid}`);
+        console.log(
+          `MCP session initialized: ${sid} (account: ${req.accountName})`,
+        );
       },
     });
 
     transport.onclose = () => {
-      if (transport.sessionId) {
-        delete transports[transport.sessionId];
-        console.log(`MCP session closed: ${transport.sessionId}`);
-      }
+      if (transport.sessionId) delete transports[transport.sessionId];
     };
 
     const server = createMcpServer();
@@ -326,8 +542,9 @@ async function handleMcpRequest(req, res) {
       },
       id: null,
     });
-    logActivity({
-      sessionId: sessionId || null,
+    await logActivity({
+      accountId: req.accountId,
+      accountName: req.accountName,
       calls,
       status: 400,
       durationMs: Date.now() - start,
@@ -337,18 +554,19 @@ async function handleMcpRequest(req, res) {
 
   try {
     await transport.handleRequest(req, res, req.body);
-    logActivity({
-      sessionId: transport.sessionId || sessionId || null,
+    await logActivity({
+      accountId: req.accountId,
+      accountName: req.accountName,
       calls,
       status: res.statusCode,
       durationMs: Date.now() - start,
     });
   } catch (err) {
-    logActivity({
-      sessionId: transport.sessionId || sessionId || null,
+    await logActivity({
+      accountId: req.accountId,
+      accountName: req.accountName,
       calls,
       status: "error",
-      error: err.message,
       durationMs: Date.now() - start,
     });
     throw err;
@@ -359,24 +577,20 @@ app.post("/mcp", checkAuth, handleMcpRequest);
 app.get("/mcp", checkAuth, handleMcpRequest);
 app.delete("/mcp", checkAuth, handleMcpRequest);
 
-// View recent activity: GET /activity?token=<MCP_ACCESS_TOKEN>
-// (query param, not a Bearer header, so you can open it directly in a browser)
-app.get("/activity", (req, res) => {
-  if (OWNER_PASSWORD && req.query.token !== OWNER_PASSWORD) {
-    return res
-      .status(401)
-      .json({ error: "Add ?token=<your MCP_ACCESS_TOKEN> to view this." });
-  }
-  res.json({ count: activityLog.length, events: [...activityLog].reverse() });
-});
-
 app.get("/", (req, res) => {
   res.send("MCP remote connector is running. Point your MCP client at /mcp.");
 });
 
-app.listen(PORT, () => {
-  console.log(
-    `MCP Streamable HTTP server running on port ${PORT} (endpoint: /mcp)`,
-  );
-  console.log(`OAuth metadata served from ${PUBLIC_URL}`);
-});
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(
+        `MCP Streamable HTTP server running on port ${PORT} (endpoint: /mcp)`,
+      );
+      console.log(`OAuth metadata served from ${PUBLIC_URL}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Failed to initialize database:", err);
+    process.exit(1);
+  });
