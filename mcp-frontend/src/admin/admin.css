@@ -1,0 +1,539 @@
+/* Admin dashboard — reuses the color tokens defined in ../index.css */
+
+.admin-shell {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 32px 24px 80px;
+}
+
+/* ── Connect screen ─────────────────────────────────────────────────── */
+
+.admin-login-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.admin-login-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 28px;
+}
+
+.admin-login-card h1 {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 17px;
+  letter-spacing: 0.04em;
+  margin: 0 0 6px;
+}
+
+.admin-login-card p {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin: 0 0 20px;
+  line-height: 1.5;
+}
+
+.admin-field {
+  margin-bottom: 14px;
+}
+
+.admin-field label {
+  display: block;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.admin-input,
+.admin-select {
+  width: 100%;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: "Inter", sans-serif;
+  font-size: 14px;
+  box-sizing: border-box;
+}
+
+.admin-input:focus,
+.admin-select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.admin-remember {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 18px;
+}
+
+/* ── Buttons ────────────────────────────────────────────────────────── */
+
+.admin-btn {
+  font-family: "Inter", sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 9px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.admin-btn:hover:not(:disabled) {
+  border-color: var(--text-muted);
+}
+
+.admin-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.admin-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #1a1200;
+  font-weight: 600;
+  width: 100%;
+}
+
+.admin-btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.admin-btn-small {
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+.admin-btn-danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.admin-btn-danger:hover:not(:disabled) {
+  background: rgba(229, 72, 77, 0.1);
+}
+
+/* ── Masthead / tabs ────────────────────────────────────────────────── */
+
+.admin-masthead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 20px;
+  margin-bottom: 24px;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.admin-masthead h1 {
+  font-family: "IBM Plex Mono", monospace;
+  font-weight: 700;
+  font-size: 19px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.admin-masthead .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--status-done);
+  box-shadow: 0 0 8px 2px rgba(76, 175, 125, 0.5);
+}
+
+.admin-masthead .backend-url {
+  font-family: "IBM Plex Mono", monospace;
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 3px;
+}
+
+.admin-masthead .right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.admin-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 22px;
+}
+
+.admin-tab-btn {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 8px 14px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.admin-tab-btn:hover {
+  border-color: var(--text-muted);
+  color: var(--text);
+}
+
+.admin-tab-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(255, 176, 32, 0.08);
+}
+
+/* ── Cards / panels ─────────────────────────────────────────────────── */
+
+.admin-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 20px;
+  margin-bottom: 18px;
+}
+
+.admin-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.admin-card-header h2 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.admin-card-header .hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.admin-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.admin-toolbar .admin-field {
+  margin-bottom: 0;
+  min-width: 160px;
+}
+
+/* ── Stat tiles ─────────────────────────────────────────────────────── */
+
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.stat-tile {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+
+.stat-tile .label {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.stat-tile .value {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 24px;
+  font-weight: 700;
+}
+
+/* ── Bar meter (billing totals by account) ─────────────────────────── */
+
+.bar-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.bar-row {
+  display: grid;
+  grid-template-columns: 140px 1fr 56px;
+  align-items: center;
+  gap: 12px;
+}
+
+.bar-row .bar-name {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bar-track {
+  height: 10px;
+  background: var(--panel-raised);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 4px;
+  min-width: 3px;
+  transition: width 0.25s ease;
+}
+
+.bar-row .bar-count {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-align: right;
+}
+
+/* .bar-row is also rendered as a <button> so an account can be clicked to
+   drill in — this layers button resets on top of the grid layout above. */
+button.bar-row-btn {
+  width: 100%;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 6px;
+  margin: -4px -6px;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  transition: all 0.15s ease;
+}
+button.bar-row-btn:hover {
+  background: var(--panel-raised);
+  border-color: var(--border);
+}
+button.bar-row-btn .bar-fill {
+  background: var(--accent);
+}
+button.bar-row-btn:hover .bar-fill {
+  filter: brightness(1.15);
+}
+button.bar-row-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ── Tables ─────────────────────────────────────────────────────────── */
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.admin-table th {
+  text-align: left;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  font-weight: 500;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.admin-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.admin-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.admin-table tbody tr:hover {
+  background: var(--panel-raised);
+}
+
+.admin-table tbody tr.clickable-row {
+  cursor: pointer;
+}
+
+.admin-table td.wrap {
+  white-space: normal;
+}
+
+/* ── Pills / badges ─────────────────────────────────────────────────── */
+
+.pill {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 100px;
+  border: 1px solid var(--border);
+  background: var(--panel-raised);
+  white-space: nowrap;
+}
+
+.pill .led {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.pill-active .led {
+  background: var(--status-done);
+  box-shadow: 0 0 6px 1px var(--status-done);
+}
+.pill-active {
+  color: var(--status-done);
+}
+
+.pill-inactive .led {
+  background: var(--text-muted);
+}
+.pill-inactive {
+  color: var(--text-muted);
+}
+
+.pill-admin .led {
+  background: var(--accent);
+  box-shadow: 0 0 6px 1px var(--accent);
+}
+.pill-admin {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+.pill-deleted {
+  color: var(--danger);
+  border-color: var(--danger);
+  border-style: dashed;
+}
+.pill-deleted .led {
+  background: var(--danger);
+  box-shadow: 0 0 6px 1px var(--danger);
+}
+
+/* Small inline marker for an account name whose account row no longer
+   exists (deleted), shown next to its name in Billing/Activity tables —
+   lighter-weight than a full pill since it sits inside a narrow cell. */
+.deleted-tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px dashed var(--danger);
+  border-radius: 100px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--danger);
+  white-space: nowrap;
+}
+
+.pill-status-ok {
+  color: var(--status-done);
+}
+.pill-status-err {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* ── Misc ───────────────────────────────────────────────────────────── */
+
+.admin-empty {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-muted);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 13px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+}
+
+.admin-error {
+  background: rgba(229, 72, 77, 0.1);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  margin-bottom: 16px;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.admin-loading {
+  color: var(--text-muted);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  padding: 10px 0;
+}
+
+.admin-form-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+
+.admin-form-row .admin-field {
+  flex: 1;
+  min-width: 140px;
+  margin-bottom: 0;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+}

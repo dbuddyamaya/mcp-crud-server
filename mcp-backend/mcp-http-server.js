@@ -24,6 +24,7 @@
 
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
 import crypto, { randomUUID } from "node:crypto";
 import { createClient } from "@libsql/client";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -31,6 +32,17 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createMcpServer } from "./server-factory.js";
 
 const app = express();
+
+// The admin dashboard (mcp-frontend/admin.html) is a static site that can be
+// hosted on a different origin than this API (e.g. served from Vite locally,
+// or from a separate static host), so it needs CORS to call /admin/* and
+// /mcp from the browser. This is safe to leave permissive: every /admin/*
+// route is gated on the x-admin-token header and /mcp on a bearer token —
+// neither is a cookie, so a third-party page can't ride an existing session
+// the way it could with cookie-based auth. Without `allowedHeaders` set,
+// the `cors` package reflects whatever headers the browser's preflight
+// requests (so x-admin-token and Authorization both pass through).
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -61,8 +73,20 @@ async function initDb() {
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1,
+    is_admin INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
   )`);
+  // Deployments created before is_admin existed already have an `accounts`
+  // table, so CREATE TABLE IF NOT EXISTS above is a no-op for them — add
+  // the column here. SQLite has no "ADD COLUMN IF NOT EXISTS", so we try
+  // and swallow the one error that means it's already there.
+  try {
+    await db.execute(
+      `ALTER TABLE accounts ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0`,
+    );
+  } catch (err) {
+    if (!/duplicate column/i.test(err.message)) throw err;
+  }
   await db.execute(`CREATE TABLE IF NOT EXISTS oauth_clients (
     client_id TEXT PRIMARY KEY,
     redirect_uris TEXT NOT NULL,
@@ -391,7 +415,7 @@ function checkAdmin(req, res, next) {
 
 // ── Admin: manage client accounts ────────────────────────────────────────
 app.post("/admin/accounts", checkAdmin, async (req, res) => {
-  const { name, username, password } = req.body || {};
+  const { name, username, password, is_admin } = req.body || {};
   if (!name || !username || !password) {
     return res
       .status(400)
@@ -400,58 +424,128 @@ app.post("/admin/accounts", checkAdmin, async (req, res) => {
   const id = randomUUID();
   try {
     await db.execute({
-      sql: "INSERT INTO accounts (id, name, username, password_hash, active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+      sql: "INSERT INTO accounts (id, name, username, password_hash, active, is_admin, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
       args: [
         id,
         name,
         username,
         hashPassword(password),
+        is_admin ? 1 : 0,
         new Date().toISOString(),
       ],
     });
   } catch (err) {
     return res.status(409).json({ error: "username already taken" });
   }
-  res.status(201).json({ id, name, username });
+  res.status(201).json({ id, name, username, is_admin: !!is_admin });
 });
 
 app.get("/admin/accounts", checkAdmin, async (req, res) => {
   const result = await db.execute(
-    "SELECT id, name, username, active, created_at FROM accounts ORDER BY created_at",
+    "SELECT id, name, username, active, is_admin, created_at FROM accounts ORDER BY created_at",
   );
   res.json({ accounts: result.rows });
 });
 
+// PATCH /admin/accounts/:id — pass `active` and/or `is_admin`; either can
+// be omitted to leave it unchanged.
 app.patch("/admin/accounts/:id", checkAdmin, async (req, res) => {
-  const { active } = req.body || {};
+  const { active, is_admin } = req.body || {};
+  const sets = [];
+  const args = [];
+  if (active !== undefined) {
+    sets.push("active = ?");
+    args.push(active ? 1 : 0);
+  }
+  if (is_admin !== undefined) {
+    sets.push("is_admin = ?");
+    args.push(is_admin ? 1 : 0);
+  }
+  if (sets.length === 0) {
+    return res.status(400).json({ error: "nothing to update" });
+  }
+  args.push(req.params.id);
   await db.execute({
-    sql: "UPDATE accounts SET active = ? WHERE id = ?",
-    args: [active ? 1 : 0, req.params.id],
+    sql: `UPDATE accounts SET ${sets.join(", ")} WHERE id = ?`,
+    args,
   });
+  res.json({ ok: true });
+});
+
+// DELETE /admin/accounts/:id — removes the account and immediately revokes
+// its OAuth tokens/pending codes, so any MCP client using it is cut off on
+// its next request. Past usage_events rows are kept on purpose: they
+// already store a snapshot of the account's name (account_name), so
+// historical billing/activity reports for this account stay intact even
+// after it's gone.
+app.delete("/admin/accounts/:id", checkAdmin, async (req, res) => {
+  const { id } = req.params;
+  const existing = await db.execute({
+    sql: "SELECT id FROM accounts WHERE id = ?",
+    args: [id],
+  });
+  if (!existing.rows[0]) {
+    return res.status(404).json({ error: "account not found" });
+  }
+
+  await db.execute({
+    sql: "DELETE FROM access_tokens WHERE account_id = ?",
+    args: [id],
+  });
+  await db.execute({
+    sql: "DELETE FROM refresh_tokens WHERE account_id = ?",
+    args: [id],
+  });
+  await db.execute({
+    sql: "DELETE FROM auth_codes WHERE account_id = ?",
+    args: [id],
+  });
+  await db.execute({ sql: "DELETE FROM accounts WHERE id = ?", args: [id] });
+
   res.json({ ok: true });
 });
 
 // ── Admin: billing report ────────────────────────────────────────────────
 // GET /admin/billing?from=2026-08-01&to=2026-09-01
+//
+// Admin accounts (is_admin = 1) are excluded from both queries below via a
+// LEFT JOIN + COALESCE: a LEFT JOIN (not an inner join) so a usage_events
+// row for a since-deleted account still counts — there's no accounts row
+// left to match, COALESCE treats that as is_admin = 0. Note this means an
+// account billed while flagged admin and later deleted would then start
+// counting again; an edge case not worth the extra bookkeeping to close.
+//
+// That same LEFT JOIN also tells us whether the account has since been
+// deleted (accounts.id IS NULL — no row left to match): each result row
+// carries an `account_deleted` flag so the dashboard can mark it, since
+// usage_events keeps a name snapshot even after the account is gone.
 app.get("/admin/billing", checkAdmin, async (req, res) => {
   const from = req.query.from || "1970-01-01";
   const to = req.query.to || new Date().toISOString();
 
   const result = await db.execute({
-    sql: `SELECT account_id, account_name, COUNT(*) as call_count
+    sql: `SELECT usage_events.account_id, usage_events.account_name, COUNT(*) as call_count,
+                 CASE WHEN accounts.id IS NULL THEN 1 ELSE 0 END as account_deleted
           FROM usage_events
-          WHERE method = 'tools/call' AND timestamp >= ? AND timestamp < ?
-          GROUP BY account_id, account_name
+          LEFT JOIN accounts ON accounts.id = usage_events.account_id
+          WHERE usage_events.method = 'tools/call'
+            AND usage_events.timestamp >= ? AND usage_events.timestamp < ?
+            AND COALESCE(accounts.is_admin, 0) = 0
+          GROUP BY usage_events.account_id, usage_events.account_name
           ORDER BY call_count DESC`,
     args: [from, to],
   });
 
   const byToolResult = await db.execute({
-    sql: `SELECT account_id, account_name, tool, COUNT(*) as call_count
+    sql: `SELECT usage_events.account_id, usage_events.account_name, usage_events.tool, COUNT(*) as call_count,
+                 CASE WHEN accounts.id IS NULL THEN 1 ELSE 0 END as account_deleted
           FROM usage_events
-          WHERE method = 'tools/call' AND timestamp >= ? AND timestamp < ?
-          GROUP BY account_id, account_name, tool
-          ORDER BY account_name, call_count DESC`,
+          LEFT JOIN accounts ON accounts.id = usage_events.account_id
+          WHERE usage_events.method = 'tools/call'
+            AND usage_events.timestamp >= ? AND usage_events.timestamp < ?
+            AND COALESCE(accounts.is_admin, 0) = 0
+          GROUP BY usage_events.account_id, usage_events.account_name, usage_events.tool
+          ORDER BY usage_events.account_name, call_count DESC`,
     args: [from, to],
   });
 
@@ -491,8 +585,12 @@ app.get("/admin/activity", checkAdmin, async (req, res) => {
   }
 
   const result = await db.execute({
-    sql: `SELECT timestamp, account_name, method, tool, status, duration_ms
-          FROM usage_events ORDER BY timestamp DESC LIMIT ?`,
+    sql: `SELECT usage_events.timestamp, usage_events.account_id, usage_events.account_name,
+                 usage_events.method, usage_events.tool, usage_events.status, usage_events.duration_ms,
+                 CASE WHEN accounts.id IS NULL THEN 1 ELSE 0 END as account_deleted
+          FROM usage_events
+          LEFT JOIN accounts ON accounts.id = usage_events.account_id
+          ORDER BY usage_events.timestamp DESC LIMIT ?`,
     args: [limit],
   });
   res.json({ count: result.rows.length, events: result.rows });
